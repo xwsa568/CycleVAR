@@ -1,12 +1,27 @@
 import os
 import sys
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..models import build_vae_var  # noqa: E402
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# 1) /workspace/CycleVAR/models
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from models import build_vae_var
+except ModuleNotFoundError:
+    # 2) /workspace/CycleVAR/VAR/models
+    var_root = PROJECT_ROOT / "VAR"
+    if str(var_root) not in sys.path:
+        sys.path.insert(0, str(var_root))
+    from models import build_vae_var
+
 
 
 def parse_patch_nums(patch_nums: Sequence[int] | str) -> Tuple[int, ...]:
