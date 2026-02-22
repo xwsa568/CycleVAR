@@ -31,5 +31,6 @@ pytz
 lpips
 clean-fid
 dominate
+vision-aided-loss
 gradio==3.43.1
 streamlit-keyup==0.2.0

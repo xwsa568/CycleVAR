@@ -17,6 +17,7 @@ CycleGAN-Turbo (`src/`) and VAR (`models/`, `utils/`).
 - `src/train_cyclevar.py`
   - Unpaired image translation training script
   - Losses: `L_cycle + L_gan + L_idt` (LPIPS optional)
+  - Discriminator: CLIP feature extractor + MLP decoder (`vision_aided_loss`, paper setting)
 - `src/inference_cyclevar.py`
   - Inference script for folder-based image translation from a trained checkpoint
 

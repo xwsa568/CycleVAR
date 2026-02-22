@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--lr_gen", type=float, default=1e-5)
     parser.add_argument("--lr_disc", type=float, default=1e-5)
+    parser.add_argument("--lr_warmup_steps", type=int, default=500)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
@@ -63,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_idt", type=float, default=1.0)
     parser.add_argument("--lambda_cycle_lpips", type=float, default=10.0)
     parser.add_argument("--lambda_idt_lpips", type=float, default=1.0)
+    parser.add_argument("--gan_disc_type", type=str, default="vagan_clip")
+    parser.add_argument("--gan_loss_type", type=str, default="multilevel_sigmoid")
 
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--save_every", type=int, default=1000)
@@ -120,36 +123,34 @@ class UnpairedImageDataset(Dataset):
         }
 
 
-class PatchDiscriminator(nn.Module):
-    def __init__(self, in_channels: int = 3, base: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, base, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base, base * 2, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(base * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base * 2, base * 4, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(base * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base * 4, base * 8, kernel_size=4, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(base * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base * 8, 1, kernel_size=4, stride=1, padding=1),
+def build_discriminator(args: argparse.Namespace, device: torch.device) -> nn.Module:
+    if args.gan_disc_type != "vagan_clip":
+        raise NotImplementedError(
+            f"Unsupported --gan_disc_type={args.gan_disc_type}. "
+            "Use 'vagan_clip' (paper setting: CLIP feature extractor + MLP decoder)."
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    try:
+        import vision_aided_loss  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "vision_aided_loss is required for paper-faithful discriminator. "
+            "Install it in your environment and retry."
+        ) from e
 
-
-class GANLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.criterion = nn.BCEWithLogitsLoss()
-
-    def forward(self, pred: torch.Tensor, is_real: bool) -> torch.Tensor:
-        target = torch.ones_like(pred) if is_real else torch.zeros_like(pred)
-        return self.criterion(pred, target)
+    disc = vision_aided_loss.Discriminator(
+        cv_type="clip",
+        loss_type=args.gan_loss_type,
+        device=str(device),
+    ).to(device)
+    disc.train()
+    disc.requires_grad_(True)
+    if hasattr(disc, "cv_ensemble"):
+        disc.cv_ensemble.requires_grad_(False)
+    for name, module in disc.named_modules():
+        if "attn" in name and hasattr(module, "fused_attn"):
+            module.fused_attn = False
+    return disc
 
 
 def maybe_build_lpips(device: torch.device):
@@ -226,6 +227,8 @@ def set_requires_grad(modules: Iterable[nn.Module], flag: bool):
     for module in modules:
         for p in module.parameters():
             p.requires_grad_(flag)
+        if flag and hasattr(module, "cv_ensemble"):
+            module.cv_ensemble.requires_grad_(False)
 
 
 def reconstruction_loss(
@@ -240,6 +243,19 @@ def reconstruction_loss(
     return loss
 
 
+def build_constant_with_warmup_scheduler(optimizer: torch.optim.Optimizer, warmup_steps: int):
+    warmup_steps = max(int(warmup_steps), 0)
+    if warmup_steps == 0:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+
+    def lr_lambda(cur_step: int):
+        if cur_step < warmup_steps:
+            return float(cur_step + 1) / float(warmup_steps)
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def save_training_state(
     path: Path,
     step: int,
@@ -249,6 +265,8 @@ def save_training_state(
     disc_y: nn.Module,
     gen_opt: torch.optim.Optimizer,
     disc_opt: torch.optim.Optimizer,
+    gen_sche,
+    disc_sche,
     args: argparse.Namespace,
 ):
     payload = {
@@ -261,6 +279,8 @@ def save_training_state(
         "disc_y": disc_y.state_dict(),
         "opt_gen": gen_opt.state_dict(),
         "opt_disc": disc_opt.state_dict(),
+        "sche_gen": gen_sche.state_dict(),
+        "sche_disc": disc_sche.state_dict(),
         "args": vars(args),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,7 +321,7 @@ def main():
         depth=args.depth,
         shared_aln=False,
         attn_l2_norm=True,
-        flash_if_available=True,
+        flash_if_available=False,
         fused_if_available=True,
     )
     load_weights(vae, args.vae_ckpt, "vae")
@@ -321,10 +341,8 @@ def main():
     ).to(device)
     model.train()
 
-    disc_x = PatchDiscriminator().to(device)
-    disc_y = PatchDiscriminator().to(device)
-    disc_x.train()
-    disc_y.train()
+    disc_x = build_discriminator(args, device)
+    disc_y = build_discriminator(args, device)
 
     lpips_model = maybe_build_lpips(device)
     if lpips_model is None:
@@ -334,12 +352,15 @@ def main():
     gen_opt = torch.optim.AdamW(
         gen_params, lr=args.lr_gen, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay
     )
+    disc_params = [p for p in list(disc_x.parameters()) + list(disc_y.parameters()) if p.requires_grad]
     disc_opt = torch.optim.AdamW(
-        list(disc_x.parameters()) + list(disc_y.parameters()),
+        disc_params,
         lr=args.lr_disc,
         betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
     )
+    gen_sche = build_constant_with_warmup_scheduler(gen_opt, args.lr_warmup_steps)
+    disc_sche = build_constant_with_warmup_scheduler(disc_opt, args.lr_warmup_steps)
 
     start_step = 0
     start_epoch = 0
@@ -350,13 +371,28 @@ def main():
         model.load_state_dict(resume["cyclevar"], strict=False)
         disc_x.load_state_dict(resume["disc_x"], strict=False)
         disc_y.load_state_dict(resume["disc_y"], strict=False)
-        gen_opt.load_state_dict(resume["opt_gen"])
-        disc_opt.load_state_dict(resume["opt_disc"])
+        try:
+            gen_opt.load_state_dict(resume["opt_gen"])
+        except Exception as e:
+            print(f"[warn] failed to load gen optimizer state: {e}")
+        try:
+            disc_opt.load_state_dict(resume["opt_disc"])
+        except Exception as e:
+            print(f"[warn] failed to load disc optimizer state: {e}")
+        if "sche_gen" in resume:
+            try:
+                gen_sche.load_state_dict(resume["sche_gen"])
+            except Exception as e:
+                print(f"[warn] failed to load gen scheduler state: {e}")
+        if "sche_disc" in resume:
+            try:
+                disc_sche.load_state_dict(resume["sche_disc"])
+            except Exception as e:
+                print(f"[warn] failed to load disc scheduler state: {e}")
         start_step = int(resume.get("step", 0))
         start_epoch = int(resume.get("epoch", 0))
         print(f"[resume] step={start_step}, epoch={start_epoch}")
 
-    criterion_gan = GANLoss()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -392,7 +428,7 @@ def main():
             loss_idt = reconstruction_loss(idt_src, src, lpips_model, args.lambda_idt_lpips) + reconstruction_loss(
                 idt_tgt, tgt, lpips_model, args.lambda_idt_lpips
             )
-            loss_gan_g = criterion_gan(disc_y(fake_tgt), True) + criterion_gan(disc_x(fake_src), True)
+            loss_gan_g = disc_y(fake_tgt, for_G=True).mean() + disc_x(fake_src, for_G=True).mean()
             loss_g = (
                 args.lambda_cycle * loss_cycle
                 + args.lambda_idt * loss_idt
@@ -402,15 +438,16 @@ def main():
             if args.max_grad_norm > 0:
                 nn.utils.clip_grad_norm_(gen_params, max_norm=args.max_grad_norm)
             gen_opt.step()
+            gen_sche.step()
 
             # Discriminator update.
             set_requires_grad([disc_x, disc_y], True)
             disc_opt.zero_grad(set_to_none=True)
             loss_d_x = 0.5 * (
-                criterion_gan(disc_x(src), True) + criterion_gan(disc_x(fake_src.detach()), False)
+                disc_x(src, for_real=True).mean() + disc_x(fake_src.detach(), for_real=False).mean()
             )
             loss_d_y = 0.5 * (
-                criterion_gan(disc_y(tgt), True) + criterion_gan(disc_y(fake_tgt.detach()), False)
+                disc_y(tgt, for_real=True).mean() + disc_y(fake_tgt.detach(), for_real=False).mean()
             )
             loss_d = args.lambda_gan * (loss_d_x + loss_d_y)
             loss_d.backward()
@@ -420,6 +457,7 @@ def main():
                     max_norm=args.max_grad_norm,
                 )
             disc_opt.step()
+            disc_sche.step()
 
             global_step += 1
 
@@ -427,6 +465,8 @@ def main():
                 elapsed = time.time() - tic
                 print(
                     f"[step {global_step:07d}/{total_steps}] "
+                    f"lr_g={gen_opt.param_groups[0]['lr']:.2e} "
+                    f"lr_d={disc_opt.param_groups[0]['lr']:.2e} "
                     f"loss_G={loss_g.item():.4f} "
                     f"(cycle={loss_cycle.item():.4f}, idt={loss_idt.item():.4f}, gan={loss_gan_g.item():.4f}) "
                     f"loss_D={loss_d.item():.4f} "
@@ -444,6 +484,8 @@ def main():
                     disc_y=disc_y,
                     gen_opt=gen_opt,
                     disc_opt=disc_opt,
+                    gen_sche=gen_sche,
+                    disc_sche=disc_sche,
                     args=args,
                 )
                 print(f"[ckpt] saved {ckpt_path}")
@@ -461,6 +503,8 @@ def main():
         disc_y=disc_y,
         gen_opt=gen_opt,
         disc_opt=disc_opt,
+        gen_sche=gen_sche,
+        disc_sche=disc_sche,
         args=args,
     )
     print(f"[done] saved {last_ckpt}")
