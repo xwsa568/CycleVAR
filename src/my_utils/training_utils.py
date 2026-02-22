@@ -249,13 +249,6 @@ def parse_args_cyclevar_training():
     parser.add_argument("--lr_num_cycles", type=int, default=1)
     parser.add_argument("--lr_power", type=float, default=1.0)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default="no",
-        choices=["no", "fp16", "bf16"],
-        help="Mixed precision mode used by Accelerate. Use 'no' for maximum numeric stability.",
-    )
 
     # Memory/performance.
     parser.add_argument("--allow_tf32", action="store_true")

@@ -30,24 +30,8 @@ class _DummyTokenizer:
         return _Out()
 
 
-def _ensure_finite(name: str, tensor: torch.Tensor):
-    if torch.isfinite(tensor).all():
-        return
-    bad = (~torch.isfinite(tensor)).sum().item()
-    total = tensor.numel()
-    safe = torch.nan_to_num(tensor.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-    raise FloatingPointError(
-        f"[non-finite] {name}: {bad}/{total} values are NaN/Inf "
-        f"(min={safe.min().item():.5f}, max={safe.max().item():.5f})"
-    )
-
-
 def main(args):
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
-    )
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, log_with=args.report_to)
     set_seed(args.seed)
 
     if accelerator.is_main_process:
@@ -232,25 +216,17 @@ def main(args):
                 img_a = batch["pixel_values_src"].float()
                 img_b = batch["pixel_values_tgt"].float()
                 bsz = img_a.shape[0]
-                _ensure_finite("img_a", img_a)
-                _ensure_finite("img_b", img_b)
 
                 # Cycle consistency
                 cyc_fake_b = generator(img_a, "a2b")
                 cyc_rec_a = generator(cyc_fake_b, "b2a")
-                _ensure_finite("cyc_fake_b", cyc_fake_b)
-                _ensure_finite("cyc_rec_a", cyc_rec_a)
                 loss_cycle_a = crit_cycle(cyc_rec_a, img_a) * args.lambda_cycle
                 loss_cycle_a = loss_cycle_a + net_lpips(cyc_rec_a, img_a).mean() * args.lambda_cycle_lpips
 
                 cyc_fake_a = generator(img_b, "b2a")
                 cyc_rec_b = generator(cyc_fake_a, "a2b")
-                _ensure_finite("cyc_fake_a", cyc_fake_a)
-                _ensure_finite("cyc_rec_b", cyc_rec_b)
                 loss_cycle_b = crit_cycle(cyc_rec_b, img_b) * args.lambda_cycle
                 loss_cycle_b = loss_cycle_b + net_lpips(cyc_rec_b, img_b).mean() * args.lambda_cycle_lpips
-                _ensure_finite("loss_cycle_a", loss_cycle_a)
-                _ensure_finite("loss_cycle_b", loss_cycle_b)
 
                 accelerator.backward(loss_cycle_a + loss_cycle_b, retain_graph=False)
                 if accelerator.sync_gradients:
@@ -262,12 +238,8 @@ def main(args):
                 # GAN loss (generator)
                 fake_a = generator(img_b, "b2a")
                 fake_b = generator(img_a, "a2b")
-                _ensure_finite("fake_a", fake_a)
-                _ensure_finite("fake_b", fake_b)
                 loss_gan_a = net_disc_a(fake_b, for_G=True).mean() * args.lambda_gan
                 loss_gan_b = net_disc_b(fake_a, for_G=True).mean() * args.lambda_gan
-                _ensure_finite("loss_gan_a", loss_gan_a)
-                _ensure_finite("loss_gan_b", loss_gan_b)
                 accelerator.backward(loss_gan_a + loss_gan_b, retain_graph=False)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params_gen, args.max_grad_norm)
@@ -280,14 +252,10 @@ def main(args):
                 idt_a = generator(img_b, "a2b")
                 loss_idt_a = crit_idt(idt_a, img_b) * args.lambda_idt
                 loss_idt_a = loss_idt_a + net_lpips(idt_a, img_b).mean() * args.lambda_idt_lpips
-                _ensure_finite("idt_a", idt_a)
-                _ensure_finite("loss_idt_a", loss_idt_a)
 
                 idt_b = generator(img_a, "b2a")
                 loss_idt_b = crit_idt(idt_b, img_a) * args.lambda_idt
                 loss_idt_b = loss_idt_b + net_lpips(idt_b, img_a).mean() * args.lambda_idt_lpips
-                _ensure_finite("idt_b", idt_b)
-                _ensure_finite("loss_idt_b", loss_idt_b)
 
                 loss_g_idt = loss_idt_a + loss_idt_b
                 accelerator.backward(loss_g_idt, retain_graph=False)
@@ -301,7 +269,6 @@ def main(args):
                 loss_d_a_fake = net_disc_a(fake_b.detach(), for_real=False).mean() * args.lambda_gan
                 loss_d_b_fake = net_disc_b(fake_a.detach(), for_real=False).mean() * args.lambda_gan
                 loss_d_fake = (loss_d_a_fake + loss_d_b_fake) * 0.5
-                _ensure_finite("loss_d_fake", loss_d_fake)
                 accelerator.backward(loss_d_fake, retain_graph=False)
                 if accelerator.sync_gradients:
                     params_to_clip = list(net_disc_a.parameters()) + list(net_disc_b.parameters())
@@ -314,7 +281,6 @@ def main(args):
                 loss_d_a_real = net_disc_a(img_b, for_real=True).mean() * args.lambda_gan
                 loss_d_b_real = net_disc_b(img_a, for_real=True).mean() * args.lambda_gan
                 loss_d_real = (loss_d_a_real + loss_d_b_real) * 0.5
-                _ensure_finite("loss_d_real", loss_d_real)
                 accelerator.backward(loss_d_real, retain_graph=False)
                 if accelerator.sync_gradients:
                     params_to_clip = list(net_disc_a.parameters()) + list(net_disc_b.parameters())

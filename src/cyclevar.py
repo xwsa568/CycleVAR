@@ -243,19 +243,15 @@ class CycleVAR(nn.Module):
     def forward(self, x: torch.Tensor, direction: str, hard_decode: bool = False) -> torch.Tensor:
         bsz = x.shape[0]
         labels = self._label_for_direction(direction, bsz, x.device)
+        x_var, src_f_hat = self._encode_source_to_var_input(x)
+        logits = self.var(labels, x_var)
+        pred_f_hat = self._decode_from_logits(logits, hard=hard_decode)
 
-        # Keep the tokenizer + VAR path in fp32 for stability under mixed precision training.
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            x_fp32 = x.float()
-            x_var, src_f_hat = self._encode_source_to_var_input(x_fp32)
-            logits = self.var(labels, x_var.float())
-            pred_f_hat = self._decode_from_logits(logits, hard=hard_decode)
+        if self.src_fusion_alpha < 1.0:
+            alpha = self.src_fusion_alpha
+            pred_f_hat = alpha * pred_f_hat + (1.0 - alpha) * src_f_hat
 
-            if self.src_fusion_alpha < 1.0:
-                alpha = self.src_fusion_alpha
-                pred_f_hat = alpha * pred_f_hat + (1.0 - alpha) * src_f_hat
-
-            out = self.vae.fhat_to_img(pred_f_hat).clamp(-1, 1)
+        out = self.vae.fhat_to_img(pred_f_hat).clamp(-1, 1)
         return out
 
     def load_vqvae_ckpt(self, ckpt_path: str):
