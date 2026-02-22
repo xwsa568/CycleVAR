@@ -6,13 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
-_VAR_ROOT = os.path.join(_REPO_ROOT, "VAR")
-if _VAR_ROOT not in sys.path:
-    sys.path.insert(0, _VAR_ROOT)
-
-from models import build_vae_var  # noqa: E402
+from ..models import build_vae_var  # noqa: E402
 
 
 def parse_patch_nums(patch_nums: Sequence[int] | str) -> Tuple[int, ...]:
