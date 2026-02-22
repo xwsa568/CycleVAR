@@ -1,25 +1,28 @@
 # CycleVAR
 
-`src`는 CycleGAN-Turbo 기반, `models/utils/train.py/trainer.py`는 VAR 기반으로 가져온 상태에서,
-논문 **CycleVAR (arXiv:2506.23347)** 의 핵심 아이디어를 반영해 재구현한 코드가 포함되어 있습니다.
+This repository is a practical reimplementation of key ideas from
+**CycleVAR (arXiv:2506.23347)**, built by combining components from
+CycleGAN-Turbo (`src/`) and VAR (`models/`, `utils/`).
 
-## 추가된 핵심 파일
+## Core Files
 
 - `dist.py`
-  - VAR 코드에서 사용하는 분산 유틸 모듈.
+  - Distributed utility module used by VAR code.
 - `src/cyclevar.py`
-  - CycleVAR 핵심 로직:
-    - 멀티스케일 source token prefill
+  - Main CycleVAR logic:
+    - Multi-scale source token prefill
     - Softmax Relaxed Quantization (SRQ)
-    - `parallel one-step` / `serial multi-step` 생성
-    - cycle loss 경로를 위한 differentiable tokenization(STE 옵션)
+    - `parallel one-step` / `serial multi-step` generation
+    - Differentiable tokenization path (optional STE) for cycle loss training
 - `src/train_cyclevar.py`
-  - unpaired image translation 학습 스크립트
-  - loss: `L_cycle + L_gan + L_idt` (LPIPS 옵션)
+  - Unpaired image translation training script
+  - Losses: `L_cycle + L_gan + L_idt` (LPIPS optional)
+- `src/inference_cyclevar.py`
+  - Inference script for folder-based image translation from a trained checkpoint
 
-## 데이터 폴더 구조
+## Dataset Layout
 
-아래 형태를 기본으로 가정합니다.
+Expected structure:
 
 ```text
 DATASET_ROOT/
@@ -27,7 +30,7 @@ DATASET_ROOT/
   train_B/
 ```
 
-## 학습 실행 예시
+## Training Example
 
 ```bash
 python src/train_cyclevar.py \
@@ -42,7 +45,7 @@ python src/train_cyclevar.py \
   --max_steps 20000
 ```
 
-## 추론 실행 예시
+## Inference Example
 
 ```bash
 python src/inference_cyclevar.py \
@@ -54,24 +57,24 @@ python src/inference_cyclevar.py \
   --image_prep resize_256
 ```
 
-## 주요 옵션
+## Important Options
 
 - `--generation_mode {parallel,serial}`
-  - 논문의 두 생성 모드.
+  - Two generation modes from the paper.
 - `--alpha`
-  - source feature와 predicted feature 융합 가중치.
+  - Fusion ratio between source feature and predicted feature.
 - `--srq_temperature`
-  - SRQ softmax temperature.
+  - Softmax temperature for SRQ.
 - `--tokenize_temperature`
-  - tokenizer 쪽 relaxed/hard token temperature.
+  - Temperature used in tokenization-side relaxed/hard assignment.
 - `--disable_tokenizer_ste`
-  - tokenizer STE 비활성화.
+  - Disables tokenizer STE.
 
-## 체크포인트
+## Checkpoint Contents
 
-`src/train_cyclevar.py`는 아래를 저장합니다.
+`src/train_cyclevar.py` saves:
 
-- `cyclevar` (전체 모델 상태)
+- `cyclevar` (full model state)
 - `var`, `vae`
 - `disc_x`, `disc_y`
 - `opt_gen`, `opt_disc`
