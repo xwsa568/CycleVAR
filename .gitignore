@@ -1,6 +1,12 @@
 datasets/
 ckpts/
 
+__pycache__/
+*.py[cod]
+
+.DS_Store
+
+
 single_step_translation/
 
 # Byte-compiled / optimized / DLL files
