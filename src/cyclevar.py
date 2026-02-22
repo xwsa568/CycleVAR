@@ -99,7 +99,7 @@ class CycleVAR(nn.Module):
             depth=var_depth,
             shared_aln=False,
             attn_l2_norm=True,
-            flash_if_available=True,
+            flash_if_available=False,
             fused_if_available=True,
             init_adaln=0.5,
             init_adaln_gamma=1e-5,
