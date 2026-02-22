@@ -181,6 +181,85 @@ def parse_args_unpaired_training():
     return args
 
 
+def parse_args_cyclevar_training():
+    """
+    Parses command-line arguments for CycleVAR training.
+    The optimization and loss setup follows CycleGAN-Turbo, while the generator is replaced by VAR.
+    """
+    parser = argparse.ArgumentParser(description="CycleVAR training script.")
+
+    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
+
+    # Losses (same structure as CycleGAN-Turbo/CycleVAR paper).
+    parser.add_argument("--gan_disc_type", default="vagan_clip")
+    parser.add_argument("--gan_loss_type", default="multilevel_sigmoid")
+    parser.add_argument("--lambda_gan", default=0.5, type=float)
+    parser.add_argument("--lambda_idt", default=1.0, type=float)
+    parser.add_argument("--lambda_cycle", default=1.0, type=float)
+    parser.add_argument("--lambda_cycle_lpips", default=10.0, type=float)
+    parser.add_argument("--lambda_idt_lpips", default=1.0, type=float)
+
+    # Dataset and dataloader.
+    parser.add_argument("--dataset_folder", required=True, type=str)
+    parser.add_argument("--train_img_prep", required=True, type=str)
+    parser.add_argument("--val_img_prep", required=True, type=str)
+    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument("--train_batch_size", type=int, default=1)
+    parser.add_argument("--max_train_epochs", type=int, default=100)
+    parser.add_argument("--max_train_steps", type=int, default=None)
+
+    # CycleVAR/VAR generator setup.
+    parser.add_argument("--vqvae_ckpt_path", type=str, default=None, help="Path to pretrained VQVAE checkpoint.")
+    parser.add_argument("--var_ckpt_path", type=str, default=None, help="Path to pretrained VAR checkpoint.")
+    parser.add_argument("--resume_cyclevar_ckpt", type=str, default=None, help="Path to CycleVAR fine-tuned checkpoint.")
+    parser.add_argument("--var_patch_nums", type=str, default="1,2,3,4,5,6,8,10,13,16")
+    parser.add_argument("--var_depth", type=int, default=16)
+    parser.add_argument("--var_num_classes", type=int, default=1000)
+    parser.add_argument("--label_a", type=int, default=0, help="Domain-A condition label ID.")
+    parser.add_argument("--label_b", type=int, default=1, help="Domain-B condition label ID.")
+    parser.add_argument("--srq_temperature", type=float, default=2.0, help="Temperature for Softmax Relaxed Quantization.")
+    parser.add_argument("--source_temperature", type=float, default=1.0, help="Temperature used for differentiable source tokenization.")
+    parser.add_argument("--use_srq_gumbel", action="store_true", help="Enable Gumbel noise in SRQ.")
+    parser.add_argument("--disable_source_ste", action="store_true", help="Disable straight-through estimator for source tokenization.")
+    parser.add_argument("--src_fusion_alpha", type=float, default=1.0, help="Source/target feature fusion ratio (alpha).")
+
+    # Validation and logging.
+    parser.add_argument("--viz_freq", type=int, default=20)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--report_to", type=str, default="wandb")
+    parser.add_argument("--tracker_project_name", type=str, required=True)
+    parser.add_argument("--validation_steps", type=int, default=500)
+    parser.add_argument("--validation_num_images", type=int, default=-1, help="Use all images if set to -1.")
+    parser.add_argument("--checkpointing_steps", type=int, default=500)
+
+    # Optimization.
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2)
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--max_grad_norm", default=10.0, type=float)
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant_with_warmup",
+        help='Scheduler type. One of ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"].',
+    )
+    parser.add_argument("--lr_warmup_steps", type=int, default=500)
+    parser.add_argument("--lr_num_cycles", type=int, default=1)
+    parser.add_argument("--lr_power", type=float, default=1.0)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+
+    # Memory/performance.
+    parser.add_argument("--allow_tf32", action="store_true")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
+
+    args = parser.parse_args()
+    args.use_source_ste = not args.disable_source_ste
+    return args
+
+
 def build_transform(image_prep):
     """
     Constructs a transformation pipeline based on the specified image preparation method.

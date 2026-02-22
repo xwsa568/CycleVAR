@@ -1,332 +1,319 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union
+import os
+import sys
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models import VAR, VQVAE
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
+_VAR_ROOT = os.path.join(_REPO_ROOT, "VAR")
+if _VAR_ROOT not in sys.path:
+    sys.path.insert(0, _VAR_ROOT)
+
+from models import build_vae_var  # noqa: E402
 
 
-Tensor = torch.Tensor
+def parse_patch_nums(patch_nums: Sequence[int] | str) -> Tuple[int, ...]:
+    if isinstance(patch_nums, str):
+        parsed = [int(tok.strip()) for tok in patch_nums.split(",") if tok.strip()]
+        if not parsed:
+            raise ValueError("patch_nums string must contain at least one integer")
+        return tuple(parsed)
+    return tuple(int(x) for x in patch_nums)
 
 
-@dataclass
-class CycleVAROutput:
-    image: Tensor
-    logits_per_scale: List[Tensor]
-    pred_embeds_per_scale: List[Tensor]
-    source_context_per_scale: List[Tensor]
-    fused_latent: Tensor
+def _strip_prefix_if_needed(sd: Dict[str, torch.Tensor], prefix: str = "module.") -> Dict[str, torch.Tensor]:
+    if not sd:
+        return sd
+    if any(k.startswith(prefix) for k in sd.keys()):
+        return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
+    return sd
+
+
+def _extract_sub_state(ckpt: Dict, candidates: Iterable[str]) -> Dict:
+    if not isinstance(ckpt, dict):
+        return ckpt
+    for key in candidates:
+        if key in ckpt and isinstance(ckpt[key], dict):
+            return ckpt[key]
+    return ckpt
+
+
+class SRQQuantizer(nn.Module):
+    def __init__(self, embedding: nn.Embedding):
+        super().__init__()
+        self.embedding = embedding
+
+    def forward(self, logits: torch.Tensor, temperature: float, use_gumbel: bool = False) -> torch.Tensor:
+        # logits: B x L x V -> embeddings: B x L x C
+        tau = max(float(temperature), 1e-6)
+        logits_fp32 = logits.float()
+        if use_gumbel:
+            # Gumbel(0,1) noise, used in the paper's SRQ ablation.
+            gumbel = -torch.empty_like(logits_fp32).exponential_().log()
+            logits_fp32 = logits_fp32 + gumbel
+        probs = torch.softmax(logits_fp32 / tau, dim=-1)
+        return probs @ self.embedding.weight.float()
 
 
 class CycleVAR(nn.Module):
-    """
-    Re-implementation of CycleVAR core generation mechanics:
-    1) Multi-scale source-token prefill.
-    2) Softmax Relaxed Quantization (SRQ).
-    3) Parallel one-step and serial multi-step generation modes.
-    """
-
     def __init__(
         self,
-        vae: VQVAE,
-        var: VAR,
-        alpha: float = 0.7,
+        vqvae_ckpt_path: Optional[str] = None,
+        var_ckpt_path: Optional[str] = None,
+        cyclevar_ckpt_path: Optional[str] = None,
+        *,
+        patch_nums: Sequence[int] | str = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
+        var_depth: int = 16,
+        num_classes: int = 1000,
+        label_a: int = 0,
+        label_b: int = 1,
         srq_temperature: float = 2.0,
-        tokenize_temperature: float = 1.0,
-        use_tokenizer_ste: bool = True,
-        freeze_tokenizer: bool = True,
+        source_temperature: float = 1.0,
+        use_srq_gumbel: bool = False,
+        use_source_ste: bool = True,
+        src_fusion_alpha: float = 1.0,
     ):
         super().__init__()
-        self.vae = vae
-        self.var = var
-        self.alpha = alpha
-        self.srq_temperature = srq_temperature
-        self.tokenize_temperature = tokenize_temperature
-        self.use_tokenizer_ste = use_tokenizer_ste
+        self.patch_nums = parse_patch_nums(patch_nums)
 
-        if freeze_tokenizer:
-            for p in self.vae.parameters():
-                p.requires_grad_(False)
+        vae_local, var_model = build_vae_var(
+            V=4096,
+            Cvae=32,
+            ch=160,
+            share_quant_resi=4,
+            device="cuda",
+            patch_nums=self.patch_nums,
+            num_classes=num_classes,
+            depth=var_depth,
+            shared_aln=False,
+            attn_l2_norm=True,
+            flash_if_available=True,
+            fused_if_available=True,
+            init_adaln=0.5,
+            init_adaln_gamma=1e-5,
+            init_head=0.02,
+            init_std=-1,
+        )
 
-        self.patch_nums: Tuple[int, ...] = tuple(self.var.patch_nums)
-        self.num_scales = len(self.patch_nums)
-        self.max_pn = self.patch_nums[-1]
-        self.codebook = self.vae.quantize.embedding
-        self.quant_resi = self.vae.quantize.quant_resi
+        self.vae = vae_local
+        self.var = var_model
+        # CycleVAR uses explicit target-domain conditions; disable classifier-free label dropout.
+        self.var.cond_drop_rate = 0.0
+        self.num_classes = int(num_classes)
 
-    def _prepare_labels(self, labels: Union[int, Tensor], batch: int, device: torch.device) -> Tensor:
-        if isinstance(labels, int):
-            return torch.full((batch,), labels, device=device, dtype=torch.long)
-        if labels.ndim != 1:
-            raise ValueError(f"labels must be shape [B], got {tuple(labels.shape)}")
-        return labels.to(device=device, dtype=torch.long)
+        self.srq = SRQQuantizer(self.vae.quantize.embedding)
+        self.srq_temperature = float(srq_temperature)
+        self.source_temperature = float(source_temperature)
+        self.use_srq_gumbel = bool(use_srq_gumbel)
+        self.use_source_ste = bool(use_source_ste)
+        self.src_fusion_alpha = float(src_fusion_alpha)
+
+        self.label_a = int(label_a)
+        self.label_b = int(label_b)
+        self._has_loaded_vqvae = False
+
+        if vqvae_ckpt_path is not None:
+            self.load_vqvae_ckpt(vqvae_ckpt_path)
+            self._has_loaded_vqvae = True
+        if var_ckpt_path is not None:
+            self.load_var_ckpt(var_ckpt_path)
+
+        # Freeze visual tokenizer as in CycleVAR.
+        self.vae.eval()
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+
+        if cyclevar_ckpt_path is not None:
+            self.load_cyclevar_ckpt(cyclevar_ckpt_path)
+
+    @property
+    def begin_ends(self) -> List[Tuple[int, int]]:
+        return self.var.begin_ends
 
     @staticmethod
-    def _pairwise_sq_dist(x: Tensor, codebook: Tensor) -> Tensor:
-        # x: [B, N, C], codebook: [V, C] -> [B, N, V]
-        x2 = (x * x).sum(dim=-1, keepdim=True)
-        c2 = (codebook * codebook).sum(dim=-1).view(1, 1, -1)
-        xc = torch.matmul(x, codebook.t())
-        return x2 + c2 - 2.0 * xc
+    def _pairwise_neg_sqdist(z_flat: torch.Tensor, emb_weight: torch.Tensor) -> torch.Tensor:
+        z_sq = (z_flat ** 2).sum(dim=-1, keepdim=True)
+        e_sq = (emb_weight ** 2).sum(dim=-1).unsqueeze(0)
+        return -(z_sq + e_sq - 2.0 * (z_flat @ emb_weight.t()))
 
-    def _sample_codebook_tokens(
-        self,
-        token_features: Tensor,
-        temperature: float,
-        differentiable: bool,
-        hard: bool,
-    ) -> Tuple[Tensor, Tensor]:
-        # token_features: [B, N, Cvae]
-        logits = -self._pairwise_sq_dist(token_features, self.codebook.weight)
+    def _stage_tokens_from_source(self, z_blc: torch.Tensor) -> torch.Tensor:
+        emb = self.vae.quantize.embedding.weight.float()
+        z_flat = z_blc.reshape(-1, z_blc.shape[-1]).float()
 
-        if hard and not differentiable:
-            idx = logits.argmax(dim=-1)
-            token_embed = F.embedding(idx, self.codebook.weight)
-            return token_embed, logits
+        neg_d = self._pairwise_neg_sqdist(z_flat, emb)
+        hard_idx = torch.argmax(neg_d, dim=-1)
+        hard_embed = emb.index_select(0, hard_idx)
 
-        t = max(float(temperature), 1e-6)
-        probs = torch.softmax(logits / t, dim=-1)
-        soft_embed = torch.matmul(probs, self.codebook.weight)
+        soft_embed = self.srq(neg_d.unsqueeze(0), temperature=self.source_temperature, use_gumbel=False).squeeze(0)
 
-        if hard and differentiable and self.use_tokenizer_ste:
-            idx = probs.argmax(dim=-1)
-            hard_embed = F.embedding(idx, self.codebook.weight)
-            # Forward uses hard tokens, backward flows through the soft mixture.
-            token_embed = hard_embed + (soft_embed - soft_embed.detach())
-            return token_embed, logits
+        if self.use_source_ste:
+            # Straight-through estimator: hard in forward, soft in backward.
+            out = soft_embed + (hard_embed - soft_embed).detach()
+        else:
+            out = hard_embed
 
-        if hard:
-            idx = probs.argmax(dim=-1)
-            token_embed = F.embedding(idx, self.codebook.weight)
-            return token_embed, logits
+        return out.view(z_blc.shape[0], z_blc.shape[1], z_blc.shape[2])
 
-        return soft_embed, logits
+    def _encode_source_to_var_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        f_src = self.vae.quant_conv(self.vae.encoder(x))
+        bsz, cvae, h, w = f_src.shape
+        expected_hw = self.patch_nums[-1]
+        if (h, w) != (expected_hw, expected_hw):
+            raise ValueError(
+                f"Tokenizer feature size mismatch: got {(h, w)}, expected {(expected_hw, expected_hw)}. "
+                "Use a VAR checkpoint/patch schedule matching your input resolution."
+            )
 
-    def tokenize_to_multiscale_context(
-        self,
-        images: Tensor,
-        differentiable: bool = True,
-    ) -> List[Tensor]:
-        """
-        Returns:
-            List of K tensors, each [B, p_k^2, Cvae], corresponding to F_k.
-        """
-        if images.ndim != 4:
-            raise ValueError(f"images must be [B,3,H,W], got {tuple(images.shape)}")
-
-        feat = self.vae.quant_conv(self.vae.encoder(images))
-        bsz, cvae, _, _ = feat.shape
-
-        f_rest = feat
-        f_hat = torch.zeros_like(feat)
-        contexts: List[Tensor] = []
-        denom = max(self.num_scales - 1, 1)
+        sn = len(self.patch_nums)
+        f_rest = f_src
+        f_hat = torch.zeros_like(f_src)
+        stage_maps: List[torch.Tensor] = []
 
         for si, pn in enumerate(self.patch_nums):
-            if si < self.num_scales - 1:
+            if si != sn - 1:
                 z = F.interpolate(f_rest, size=(pn, pn), mode="area")
             else:
                 z = f_rest
+            z_blc = z.flatten(2).transpose(1, 2)
+            h_blc = self._stage_tokens_from_source(z_blc)
+            h_bchw = h_blc.transpose(1, 2).reshape(bsz, cvae, pn, pn)
+            stage_maps.append(h_bchw)
 
-            z_tokens = z.permute(0, 2, 3, 1).reshape(bsz, pn * pn, cvae)
-            token_embed, _ = self._sample_codebook_tokens(
-                token_features=z_tokens,
-                temperature=self.tokenize_temperature,
-                differentiable=differentiable,
-                hard=True,
-            )
-
-            h = token_embed.view(bsz, pn, pn, cvae).permute(0, 3, 1, 2).contiguous()
-            if si < self.num_scales - 1:
-                h_up = F.interpolate(h, size=(self.max_pn, self.max_pn), mode="bicubic")
-            else:
-                h_up = h
-
-            h_up = self.quant_resi[si / denom](h_up)
+            h_up = F.interpolate(h_bchw, size=(h, w), mode="bicubic") if si != sn - 1 else h_bchw
+            h_up = self.vae.quantize.quant_resi[si / max(sn - 1, 1)](h_up)
             f_hat = f_hat + h_up
             f_rest = f_rest - h_up
 
-            fk = F.interpolate(f_hat, size=(pn, pn), mode="area")
-            fk = fk.view(bsz, cvae, pn * pn).transpose(1, 2).contiguous()
-            contexts.append(fk)
+        # Build teacher-forcing input exactly as VAR does for next-scale prediction.
+        tf_inputs: List[torch.Tensor] = []
+        f_partial = torch.zeros_like(f_hat)
+        for si in range(sn - 1):
+            pn = self.patch_nums[si]
+            pn_next = self.patch_nums[si + 1]
+            h_si = stage_maps[si]
+            h_up = F.interpolate(h_si, size=(h, w), mode="bicubic")
+            h_up = self.vae.quantize.quant_resi[si / max(sn - 1, 1)](h_up)
+            f_partial = f_partial + h_up
+            next_scale = F.interpolate(f_partial, size=(pn_next, pn_next), mode="area")
+            tf_inputs.append(next_scale.flatten(2).transpose(1, 2))
 
-        return contexts
+        x_var = torch.cat(tf_inputs, dim=1).float()
+        return x_var, f_hat
 
-    def _var_forward_with_context(self, label_B: Tensor, context_scales: Sequence[Tensor]) -> Tensor:
-        # context_scales: sequence of [B, p_k^2, Cvae]
-        x_prompt = torch.cat(context_scales, dim=1)
-        bsz, cur_l, _ = x_prompt.shape
+    def _decode_from_logits(self, logits_blv: torch.Tensor, hard: bool = False) -> torch.Tensor:
+        bsz = logits_blv.shape[0]
+        cvae = self.vae.Cvae
+        ms_h: List[torch.Tensor] = []
 
-        if cur_l > self.var.L:
-            raise ValueError(f"context length {cur_l} exceeds VAR length {self.var.L}")
+        for si, (bg, ed) in enumerate(self.begin_ends):
+            pn = self.patch_nums[si]
+            logits_stage = logits_blv[:, bg:ed, :]
+            if hard:
+                idx = logits_stage.argmax(dim=-1)
+                h_blc = self.vae.quantize.embedding(idx)
+            else:
+                h_blc = self.srq(logits_stage, temperature=self.srq_temperature, use_gumbel=self.use_srq_gumbel)
+            h_bchw = h_blc.transpose(1, 2).reshape(bsz, cvae, pn, pn)
+            ms_h.append(h_bchw)
 
-        cond_bd = self.var.class_emb(label_B)
-        x = self.var.word_embed(x_prompt.float())
+        f_hat = self.vae.quantize.embed_to_fhat(ms_h_BChw=ms_h, all_to_max_scale=True, last_one=True)
+        return f_hat
 
-        first_l = min(self.var.first_l, cur_l)
-        if first_l > 0:
-            x[:, :first_l] = x[:, :first_l] + cond_bd.unsqueeze(1) + self.var.pos_start[:, :first_l]
-
-        x = x + self.var.lvl_embed(self.var.lvl_1L[:, :cur_l].expand(bsz, -1)) + self.var.pos_1LC[:, :cur_l]
-        attn_bias = self.var.attn_bias_for_masking[:, :, :cur_l, :cur_l]
-        cond_bd_or_gss = self.var.shared_ada_lin(cond_bd)
-
-        # Match VAR forward precision behavior.
-        probe = x.new_ones(2, 2)
-        main_type = torch.matmul(probe, probe).dtype
-        x = x.to(dtype=main_type)
-        attn_bias = attn_bias.to(dtype=main_type)
-        cond_bd_or_gss = cond_bd_or_gss.to(dtype=main_type)
-
-        for block in self.var.blocks:
-            x = block(x=x, cond_BD=cond_bd_or_gss, attn_bias=attn_bias)
-
-        return self.var.get_logits(x.float(), cond_bd)
-
-    def _srq_logits_to_embeds(self, logits: Tensor, hard: bool = False) -> Tensor:
-        # logits: [B, N, V] -> embeds: [B, N, Cvae]
-        if hard:
-            idx = logits.argmax(dim=-1)
-            return F.embedding(idx, self.codebook.weight)
-        t = max(float(self.srq_temperature), 1e-6)
-        probs = torch.softmax(logits / t, dim=-1)
-        return torch.matmul(probs, self.codebook.weight)
-
-    def _decode_from_predicted_scales(
-        self,
-        pred_embeds_per_scale: Sequence[Tensor],
-        source_context_per_scale: Sequence[Tensor],
-    ) -> Tensor:
-        # Scale-wise residual prediction -> fused latent -> decoded image.
-        pred_maps = []
-        for pn, emb in zip(self.patch_nums, pred_embeds_per_scale):
-            m = emb.view(emb.shape[0], pn, pn, emb.shape[-1]).permute(0, 3, 1, 2).contiguous()
-            pred_maps.append(m)
-
-        pred_latent = self.vae.quantize.embed_to_fhat(pred_maps, all_to_max_scale=True, last_one=True)
-        src_top = source_context_per_scale[-1].transpose(1, 2).reshape(
-            source_context_per_scale[-1].shape[0], self.vae.Cvae, self.max_pn, self.max_pn
-        )
-        fused = self.alpha * pred_latent + (1.0 - self.alpha) * src_top
-        return self.vae.fhat_to_img(fused)
-
-    def _parallel_generate(
-        self,
-        images: Tensor,
-        labels: Tensor,
-        differentiable_tokenize: bool,
-        hard_quantization: bool,
-    ) -> CycleVAROutput:
-        contexts = self.tokenize_to_multiscale_context(images, differentiable=differentiable_tokenize)
-        logits_all = self._var_forward_with_context(labels, contexts)
-
-        logits_per_scale: List[Tensor] = []
-        embeds_per_scale: List[Tensor] = []
-        for bg, ed in self.var.begin_ends:
-            logits_k = logits_all[:, bg:ed]
-            logits_per_scale.append(logits_k)
-            embeds_per_scale.append(self._srq_logits_to_embeds(logits_k, hard=hard_quantization))
-
-        out_img = self._decode_from_predicted_scales(embeds_per_scale, contexts)
-        fused_latent = self.alpha * self.vae.quantize.embed_to_fhat(
-            [
-                e.view(e.shape[0], pn, pn, e.shape[-1]).permute(0, 3, 1, 2).contiguous()
-                for pn, e in zip(self.patch_nums, embeds_per_scale)
-            ],
-            all_to_max_scale=True,
-            last_one=True,
-        ) + (1.0 - self.alpha) * contexts[-1].transpose(1, 2).reshape(
-            contexts[-1].shape[0], self.vae.Cvae, self.max_pn, self.max_pn
-        )
-        return CycleVAROutput(
-            image=out_img,
-            logits_per_scale=logits_per_scale,
-            pred_embeds_per_scale=embeds_per_scale,
-            source_context_per_scale=contexts,
-            fused_latent=fused_latent,
-        )
-
-    def _serial_generate(
-        self,
-        images: Tensor,
-        labels: Tensor,
-        differentiable_tokenize: bool,
-        hard_quantization: bool,
-    ) -> CycleVAROutput:
-        src_contexts = self.tokenize_to_multiscale_context(images, differentiable=differentiable_tokenize)
-        fused_contexts: List[Tensor] = []
-        logits_per_scale: List[Tensor] = []
-        pred_embeds_per_scale: List[Tensor] = []
-
-        for k in range(self.num_scales):
-            prefix_contexts = list(fused_contexts)
-            prefix_contexts.append(src_contexts[k])
-            logits_prefix = self._var_forward_with_context(labels, prefix_contexts)
-
-            bg, ed = self.var.begin_ends[k]
-            logits_k = logits_prefix[:, bg:ed]
-            pred_k = self._srq_logits_to_embeds(logits_k, hard=hard_quantization)
-
-            logits_per_scale.append(logits_k)
-            pred_embeds_per_scale.append(pred_k)
-
-            pn = self.patch_nums[k]
-            pred_k_map = pred_k.view(pred_k.shape[0], pn, pn, pred_k.shape[-1]).permute(0, 3, 1, 2).contiguous()
-            src_k_map = src_contexts[k].transpose(1, 2).reshape(src_contexts[k].shape[0], self.vae.Cvae, pn, pn)
-            fused_k_map = self.alpha * pred_k_map + (1.0 - self.alpha) * src_k_map
-            fused_contexts.append(fused_k_map.flatten(2).transpose(1, 2).contiguous())
-
-        out_img = self._decode_from_predicted_scales(pred_embeds_per_scale, src_contexts)
-        fused_latent = self.alpha * self.vae.quantize.embed_to_fhat(
-            [
-                e.view(e.shape[0], pn, pn, e.shape[-1]).permute(0, 3, 1, 2).contiguous()
-                for pn, e in zip(self.patch_nums, pred_embeds_per_scale)
-            ],
-            all_to_max_scale=True,
-            last_one=True,
-        ) + (1.0 - self.alpha) * src_contexts[-1].transpose(1, 2).reshape(
-            src_contexts[-1].shape[0], self.vae.Cvae, self.max_pn, self.max_pn
-        )
-        return CycleVAROutput(
-            image=out_img,
-            logits_per_scale=logits_per_scale,
-            pred_embeds_per_scale=pred_embeds_per_scale,
-            source_context_per_scale=src_contexts,
-            fused_latent=fused_latent,
-        )
-
-    def forward(
-        self,
-        images: Tensor,
-        labels: Union[int, Tensor],
-        mode: str = "parallel",
-        differentiable_tokenize: bool = True,
-        hard_quantization: bool = False,
-        return_details: bool = False,
-    ) -> Union[Tensor, CycleVAROutput]:
-        bsz = images.shape[0]
-        label_B = self._prepare_labels(labels, bsz, images.device)
-
-        mode = mode.lower().strip()
-        if mode == "parallel":
-            out = self._parallel_generate(
-                images=images,
-                labels=label_B,
-                differentiable_tokenize=differentiable_tokenize,
-                hard_quantization=hard_quantization,
-            )
-        elif mode == "serial":
-            out = self._serial_generate(
-                images=images,
-                labels=label_B,
-                differentiable_tokenize=differentiable_tokenize,
-                hard_quantization=hard_quantization,
-            )
+    def _label_for_direction(self, direction: str, bsz: int, device: torch.device) -> torch.Tensor:
+        if direction not in {"a2b", "b2a"}:
+            raise ValueError(f"direction must be one of ['a2b', 'b2a'], got {direction}")
+        if direction == "a2b":
+            label = self.label_b
         else:
-            raise ValueError(f"Unsupported mode: {mode}")
+            label = self.label_a
+        return torch.full((bsz,), fill_value=label, dtype=torch.long, device=device)
 
-        return out if return_details else out.image
+    def forward(self, x: torch.Tensor, direction: str, hard_decode: bool = False) -> torch.Tensor:
+        bsz = x.shape[0]
+        labels = self._label_for_direction(direction, bsz, x.device)
+        x_var, src_f_hat = self._encode_source_to_var_input(x)
+        logits = self.var(labels, x_var)
+        pred_f_hat = self._decode_from_logits(logits, hard=hard_decode)
+
+        if self.src_fusion_alpha < 1.0:
+            alpha = self.src_fusion_alpha
+            pred_f_hat = alpha * pred_f_hat + (1.0 - alpha) * src_f_hat
+
+        out = self.vae.fhat_to_img(pred_f_hat).clamp(-1, 1)
+        return out
+
+    def load_vqvae_ckpt(self, ckpt_path: str):
+        sd = torch.load(ckpt_path, map_location="cpu")
+        sd = _extract_sub_state(sd, candidates=("vae_local", "vae", "state_dict"))
+        sd = _strip_prefix_if_needed(sd)
+        missing, unexpected = self.vae.load_state_dict(sd, strict=False)
+        if missing:
+            print(f"[CycleVAR] VQVAE missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[CycleVAR] VQVAE unexpected keys: {len(unexpected)}")
+
+    def load_var_ckpt(self, ckpt_path: str):
+        sd = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(sd, dict) and "trainer" in sd and isinstance(sd["trainer"], dict):
+            sd = _extract_sub_state(sd["trainer"], candidates=("var_wo_ddp", "var"))
+        else:
+            sd = _extract_sub_state(sd, candidates=("var_wo_ddp", "var", "state_dict"))
+        sd = _strip_prefix_if_needed(sd)
+        missing, unexpected = self.var.load_state_dict(sd, strict=False)
+        if missing:
+            print(f"[CycleVAR] VAR missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[CycleVAR] VAR unexpected keys: {len(unexpected)}")
+
+    def load_cyclevar_ckpt(self, ckpt_path: str):
+        sd = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(sd, dict):
+            if "vqvae_state_dict" in sd and isinstance(sd["vqvae_state_dict"], dict):
+                vq_sd = _strip_prefix_if_needed(sd["vqvae_state_dict"])
+                self.vae.load_state_dict(vq_sd, strict=False)
+                self._has_loaded_vqvae = True
+            elif (not self._has_loaded_vqvae) and isinstance(sd.get("vqvae_ckpt_path"), str):
+                vq_path = sd.get("vqvae_ckpt_path")
+                if vq_path and os.path.exists(vq_path):
+                    self.load_vqvae_ckpt(vq_path)
+                    self._has_loaded_vqvae = True
+
+        if "var_state_dict" in sd:
+            model_sd = sd["var_state_dict"]
+        elif "state_dict" in sd:
+            model_sd = sd["state_dict"]
+        else:
+            model_sd = sd
+        model_sd = _strip_prefix_if_needed(model_sd)
+        missing, unexpected = self.var.load_state_dict(model_sd, strict=False)
+        if missing:
+            print(f"[CycleVAR] CycleVAR ckpt missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[CycleVAR] CycleVAR ckpt unexpected keys: {len(unexpected)}")
+
+        self.label_a = int(sd.get("label_a", self.label_a)) if isinstance(sd, dict) else self.label_a
+        self.label_b = int(sd.get("label_b", self.label_b)) if isinstance(sd, dict) else self.label_b
+        self.srq_temperature = float(sd.get("srq_temperature", self.srq_temperature)) if isinstance(sd, dict) else self.srq_temperature
+        self.source_temperature = float(sd.get("source_temperature", self.source_temperature)) if isinstance(sd, dict) else self.source_temperature
+        self.src_fusion_alpha = float(sd.get("src_fusion_alpha", self.src_fusion_alpha)) if isinstance(sd, dict) else self.src_fusion_alpha
+
+    def get_trainable_params(self) -> List[nn.Parameter]:
+        return [p for p in self.var.parameters() if p.requires_grad]
+
+    def export_checkpoint(self) -> Dict:
+        return {
+            "var_state_dict": self.var.state_dict(),
+            "label_a": self.label_a,
+            "label_b": self.label_b,
+            "patch_nums": list(self.patch_nums),
+            "num_classes": self.num_classes,
+            "var_depth": self.var.depth,
+            "srq_temperature": self.srq_temperature,
+            "source_temperature": self.source_temperature,
+            "use_srq_gumbel": self.use_srq_gumbel,
+            "use_source_ste": self.use_source_ste,
+            "src_fusion_alpha": self.src_fusion_alpha,
+        }
