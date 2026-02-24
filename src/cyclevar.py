@@ -84,6 +84,8 @@ class CycleVAR(nn.Module):
         use_srq_gumbel: bool = False,
         use_source_ste: bool = True,
         src_fusion_alpha: float = 1.0,
+        debug_nan_guard: bool = False,
+        debug_nan_abort: bool = True,
     ):
         super().__init__()
         self.patch_nums = parse_patch_nums(patch_nums)
@@ -119,6 +121,8 @@ class CycleVAR(nn.Module):
         self.use_srq_gumbel = bool(use_srq_gumbel)
         self.use_source_ste = bool(use_source_ste)
         self.src_fusion_alpha = float(src_fusion_alpha)
+        self.debug_nan_guard = bool(debug_nan_guard)
+        self.debug_nan_abort = bool(debug_nan_abort)
 
         self.label_a = int(label_a)
         self.label_b = int(label_b)

@@ -58,7 +58,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--checkpointing_steps", type=int, default=500,)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.",)
     parser.add_argument("--gradient_checkpointing", action="store_true",)
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--lr_scheduler", type=str, default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
@@ -118,6 +118,19 @@ def parse_args_unpaired_training():
     # args for the loss function
     parser.add_argument("--gan_disc_type", default="vagan_clip")
     parser.add_argument("--gan_loss_type", default="multilevel_sigmoid")
+    parser.add_argument(
+        "--gan_output_type",
+        type=str,
+        default="conv_multi_level",
+        choices=["conv_multi_level", "pool"],
+        help="Vision-aided discriminator output head type.",
+    )
+    parser.add_argument(
+        "--gan_diffaug",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable DiffAugment inside vision-aided discriminator.",
+    )
     parser.add_argument("--lambda_gan", default=0.5, type=float)
     parser.add_argument("--lambda_idt", default=1, type=float)
     parser.add_argument("--lambda_cycle", default=1, type=float)
@@ -141,16 +154,16 @@ def parse_args_unpaired_training():
     parser.add_argument("--lora_rank_vae", default=4, type=int)
 
     # args for validation and logging
-    parser.add_argument("--viz_freq", type=int, default=20)
+    parser.add_argument("--viz_freq", type=int, default=100)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--tracker_project_name", type=str, required=True)
-    parser.add_argument("--validation_steps", type=int, default=500,)
+    parser.add_argument("--validation_steps", type=int, default=100,)
     parser.add_argument("--validation_num_images", type=int, default=-1, help="Number of images to use for validation. -1 to use all images.")
-    parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--checkpointing_steps", type=int, default=100)
 
     # args for the optimization options
-    parser.add_argument("--learning_rate", type=float, default=5e-6,)
+    parser.add_argument("--learning_rate", type=float, default=1e-5,)
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
@@ -193,6 +206,19 @@ def parse_args_cyclevar_training():
     # Losses (same structure as CycleGAN-Turbo/CycleVAR paper).
     parser.add_argument("--gan_disc_type", default="vagan_clip")
     parser.add_argument("--gan_loss_type", default="multilevel_sigmoid")
+    parser.add_argument(
+        "--gan_output_type",
+        type=str,
+        default="conv_multi_level",
+        choices=["conv_multi_level", "pool"],
+        help="Vision-aided discriminator output head type.",
+    )
+    parser.add_argument(
+        "--gan_diffaug",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable DiffAugment inside vision-aided discriminator.",
+    )
     parser.add_argument("--lambda_gan", default=0.5, type=float)
     parser.add_argument("--lambda_idt", default=1.0, type=float)
     parser.add_argument("--lambda_cycle", default=1.0, type=float)
@@ -209,6 +235,13 @@ def parse_args_cyclevar_training():
     parser.add_argument("--max_train_steps", type=int, default=None)
 
     # CycleVAR/VAR generator setup.
+    parser.add_argument(
+        "--generator_backbone",
+        type=str,
+        default="var",
+        choices=["var", "infinity"],
+        help="Generator backbone used inside the CycleVAR training pipeline.",
+    )
     parser.add_argument("--vqvae_ckpt_path", type=str, default=None, help="Path to pretrained VQVAE checkpoint.")
     parser.add_argument("--var_ckpt_path", type=str, default=None, help="Path to pretrained VAR checkpoint.")
     parser.add_argument("--resume_cyclevar_ckpt", type=str, default=None, help="Path to CycleVAR fine-tuned checkpoint.")
@@ -222,15 +255,46 @@ def parse_args_cyclevar_training():
     parser.add_argument("--use_srq_gumbel", action="store_true", help="Enable Gumbel noise in SRQ.")
     parser.add_argument("--disable_source_ste", action="store_true", help="Disable straight-through estimator for source tokenization.")
     parser.add_argument("--src_fusion_alpha", type=float, default=1.0, help="Source/target feature fusion ratio (alpha).")
+    parser.add_argument("--prompt_a", type=str, default=None, help="Text prompt for domain A (used by Infinity backbone).")
+    parser.add_argument("--prompt_b", type=str, default=None, help="Text prompt for domain B (used by Infinity backbone).")
+    parser.add_argument("--infinity_model_path", type=str, default=None, help="Path to pretrained Infinity transformer checkpoint.")
+    parser.add_argument("--infinity_vae_path", type=str, default=None, help="Path to pretrained Infinity VAE/tokenizer checkpoint.")
+    parser.add_argument(
+        "--infinity_text_encoder_ckpt",
+        type=str,
+        default=None,
+        help="Path to text tokenizer/encoder checkpoint (e.g. flan-t5-xl).",
+    )
+    parser.add_argument(
+        "--infinity_model_type",
+        type=str,
+        default="infinity_2b",
+        choices=[
+            "infinity_2b",
+            "infinity_layer12",
+            "infinity_layer16",
+            "infinity_layer24",
+            "infinity_layer32",
+            "infinity_layer40",
+            "infinity_layer48",
+        ],
+    )
+    parser.add_argument("--infinity_pn", type=str, default="0.06M", choices=["0.06M", "0.25M", "0.60M", "1M"])
+    parser.add_argument("--infinity_rope2d_each_sa_layer", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--infinity_rope2d_normalized_by_hw", type=int, default=2, choices=[0, 1, 2])
+    parser.add_argument("--infinity_add_lvl_embeding_only_first_block", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--infinity_use_bit_label", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--infinity_apply_spatial_patchify", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--infinity_use_flex_attn", type=int, default=0, choices=[0, 1])
 
     # Validation and logging.
-    parser.add_argument("--viz_freq", type=int, default=20)
+    parser.add_argument("--viz_freq", type=int, default=100)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--tracker_project_name", type=str, required=True)
-    parser.add_argument("--validation_steps", type=int, default=500)
+    parser.add_argument("--validation_steps", type=int, default=100)
     parser.add_argument("--validation_num_images", type=int, default=-1, help="Use all images if set to -1.")
-    parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--checkpointing_steps", type=int, default=100)
 
     # Optimization.
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -249,11 +313,37 @@ def parse_args_cyclevar_training():
     parser.add_argument("--lr_num_cycles", type=int, default=1)
     parser.add_argument("--lr_power", type=float, default=1.0)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"])
 
     # Memory/performance.
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
+
+    # NaN debugging.
+    parser.add_argument("--debug_nan_guard", action="store_true", help="Enable non-finite checks for inputs/intermediates/losses.")
+    parser.add_argument(
+        "--debug_nan_abort",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Abort immediately when a non-finite tensor is found.",
+    )
+    parser.add_argument("--debug_nan_every", type=int, default=1, help="Run debug checks every N optimizer-synced steps.")
+    parser.add_argument("--debug_detect_anomaly", action="store_true", help="Enable torch autograd anomaly detection.")
+    parser.add_argument("--debug_disc_state_scan", action="store_true", help="Scan discriminator parameters/buffers for non-finite values.")
+    parser.add_argument("--debug_disc_scan_max_keys", type=int, default=20, help="Maximum number of non-finite discriminator keys to print/save per scan.")
+    parser.add_argument(
+        "--debug_disc_scan_save_jsonl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write discriminator scan results to output_dir/debug_disc_state.jsonl.",
+    )
+    parser.add_argument(
+        "--gan_disable_spectral_norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable spectral norm wrappers in vision-aided discriminator decoder.",
+    )
 
     args = parser.parse_args()
     args.use_source_ste = not args.disable_source_ste
@@ -388,7 +478,7 @@ class PairedDataset(torch.utils.data.Dataset):
 
 
 class UnpairedDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_folder, split, image_prep, tokenizer):
+    def __init__(self, dataset_folder, split, image_prep, tokenizer, return_paths=False):
         """
         A dataset class for loading unpaired data samples from two distinct domains (source and target),
         typically used in unsupervised learning tasks like image-to-image translation.
@@ -411,6 +501,7 @@ class UnpairedDataset(torch.utils.data.Dataset):
             self.source_folder = os.path.join(dataset_folder, "test_A")
             self.target_folder = os.path.join(dataset_folder, "test_B")
         self.tokenizer = tokenizer
+        self.return_paths = bool(return_paths)
         with open(os.path.join(dataset_folder, "fixed_prompt_a.txt"), "r") as f:
             self.fixed_caption_src = f.read().strip()
             self.input_ids_src = self.tokenizer(
@@ -478,7 +569,7 @@ class UnpairedDataset(torch.utils.data.Dataset):
         img_t_tgt = F.to_tensor(self.T(img_pil_tgt))
         img_t_src = F.normalize(img_t_src, mean=[0.5], std=[0.5])
         img_t_tgt = F.normalize(img_t_tgt, mean=[0.5], std=[0.5])
-        return {
+        out = {
             "pixel_values_src": img_t_src,
             "pixel_values_tgt": img_t_tgt,
             "caption_src": self.fixed_caption_src,
@@ -486,3 +577,7 @@ class UnpairedDataset(torch.utils.data.Dataset):
             "input_ids_src": self.input_ids_src,
             "input_ids_tgt": self.input_ids_tgt,
         }
+        if self.return_paths:
+            out["path_src"] = img_path_src
+            out["path_tgt"] = img_path_tgt
+        return out
